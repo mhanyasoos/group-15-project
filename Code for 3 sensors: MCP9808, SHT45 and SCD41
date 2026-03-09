@@ -1,0 +1,128 @@
+#include <Wire.h>
+#include <Adafruit_MCP9808.h>
+#include <Adafruit_SHT4x.h>
+#include <SensirionI2cScd4x.h>
+
+
+// ===== TCA9548A Address =====
+#define TCAADDR 0x70
+
+
+// ===== Sensors =====
+Adafruit_MCP9808 mcp = Adafruit_MCP9808();
+Adafruit_SHT4x sht4 = Adafruit_SHT4x();
+SensirionI2cScd4x scd4x;
+
+
+// ===== Data Array =====
+// [0] MCP9808 Temp
+// [1] SHT45 Temp
+// [2] SHT45 Humidity
+// [3] SCD41 CO2
+// [4] SCD41 Temp
+// [5] SCD41 Humidity
+float sensorData[6];
+
+
+// ===== Function to select TCA channel =====
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+
+
+  Wire.beginTransmission(TCAADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+  delayMicroseconds(500);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+
+  Wire.begin();
+
+
+  // ===== Initialize MCP9808 (Channel 4) =====
+  tcaSelect(4);
+  if (!mcp.begin(0x18)) {
+    Serial.println("MCP9808 not found!");
+  }
+
+
+  // ===== Initialize SHT45 (Channel 2) =====
+  tcaSelect(2);
+  if (!sht4.begin()) {
+    Serial.println("SHT45 not found!");
+  }
+
+
+  // ===== Initialize SCD41 (Channel 7) =====
+  tcaSelect(7);
+  scd4x.begin(Wire, 0x62);
+  scd4x.startPeriodicMeasurement();
+
+
+  Serial.println("All sensors initialized.");
+}
+
+
+void loop() {
+
+
+  // ===== Read MCP9808 =====
+  tcaSelect(4);
+  sensorData[0] = mcp.readTempC();
+
+
+  // ===== Read SHT45 =====
+  tcaSelect(2);
+  sensors_event_t humidity, temp;
+  sht4.getEvent(&humidity, &temp);
+  sensorData[1] = temp.temperature;
+  sensorData[2] = humidity.relative_humidity;
+
+
+  // ===== Read SCD41 =====
+tcaSelect(7);
+
+
+uint16_t co2;
+float temperature;
+float scdhumidity;
+uint16_t error;
+bool dataReady = false;
+
+
+error = scd4x.getDataReadyStatus(dataReady);
+
+
+if (error == 0 && dataReady) {
+
+
+  error = scd4x.readMeasurement(co2, temperature, scdhumidity);
+
+
+  if (error == 0) {
+    sensorData[3] = co2;
+    sensorData[4] = temperature;
+    sensorData[5] = scdhumidity;
+  }
+}
+
+
+  // ===== Print CSV Format =====
+  // MCPtemp,SHTtemp,SHTrh,SCDco2,SCDtemp,SCDrh
+  Serial.print(sensorData[0]); Serial.print(",");
+  Serial.print(sensorData[1]); Serial.print(",");
+  Serial.print(sensorData[2]); Serial.print(",");
+  Serial.print(sensorData[3]); Serial.print(",");
+  Serial.print(sensorData[4]); Serial.print(",");
+  Serial.println(sensorData[5]);
+
+
+
+
+  delay(5000); // SCD41 updates every ~5 seconds
+}
