@@ -1,0 +1,662 @@
+#Importing modules
+# Serial is for communication with Arduino over USB 
+#time is about delays 
+#json saves sensor data to files 
+#literal_eval converts Arduino text to Python list 
+#datetime used to give timestamps that can be put on the live graph
+#The PyQt5 platform is just a popular choice for a user interface
+
+
+import sys
+import serial
+import time
+import json
+import csv
+from ast import literal_eval
+from datetime import datetime
+
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QAction, QFileDialog, QMessageBox)
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+#The Serial reader worker runs in its own thread so that the GUI doesn't freeze
+class SerialReaderWorker(QtCore.QObject):
+    data_received = QtCore.pyqtSignal(list)
+    
+    def __init__(self, port, baudrate):
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self._running = True
+
+#Function below opens serial port and  waits 5 seconds. arduino resets when serial opens
+
+    def run(self):
+        try:
+            ser = serial.Serial(self.port, self.baudrate, timeout=1)
+        except Exception as e:
+                print("Could not open serial port:", e)
+                return
+
+        time.sleep(5)
+        print(f"Listening on {self.port} ...")
+    
+        while self._running:
+            try:
+                line = ser.readline().decode('utf-8', errors='replace').strip()
+                if not line:
+                    continue
+            
+            # Parse CSV format (6 comma-separated values)
+                parts = line.split(',')
+                if len(parts) == 6:  # Expecting 6 values
+                    try:
+                        data = [float(x) for x in parts]
+                        print("Received data:", data)
+                        self.data_received.emit(data)
+                    except ValueError as e:
+                        print("Failed to parse CSV data:", line, e)
+                        
+                else:
+                    print("Other message:", line)
+            except Exception as e:
+                print("Error reading serial:", e)
+
+
+#This is opens a live graph for individual sensors
+
+class SensorPlotWindow(QMainWindow):
+    def __init__(self, sensor_index, main_window):
+        super().__init__()
+        self.sensor_index = sensor_index
+        self.main_window = main_window  # Reference to main interface
+        sensor_name = self.main_window.sensor_names[sensor_index]
+        self.setWindowTitle(f"{sensor_name} - Live Plot")
+        self.resize(600, 400)
+
+        self.figure = Figure(figsize=(5, 3))
+        self.canvas = FigureCanvas(self.figure)
+        self.setCentralWidget(self.canvas)
+        self.ax = self.figure.add_subplot(111)
+
+        sensor_type = self.main_window.sensor_types[sensor_index]
+        if sensor_type == "temperature":
+            self.ax.set_ylabel("Temperature (C)")
+        else:
+            self.ax.set_ylabel("Humidity (%)")
+        self.ax.set_xlabel("Time")
+        # Create a line for the sensor data
+        self.line, = self.ax.plot([], [], '-', label=sensor_name)
+        self.ax.legend()
+
+        # Timer to update the plot every second.
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self.updatePlot)
+        self.timer.start()
+
+
+    # Function below reads the stored data and extracts time, values and then redraws graph
+    def updatePlot(self):
+        data = self.main_window.data_record.get(self.main_window.sensor_names[self.sensor_index], [])
+        if data:
+            times = [datetime.fromisoformat(entry[0]) for entry in data]
+            values = [entry[1] for entry in data]
+            self.line.set_data(times, values)
+            self.ax.set_xlim(times[0], times[-1])
+            self.ax.relim()
+            self.ax.autoscale_view(scalex=False, scaley=True)
+        self.canvas.draw()
+
+    def closeEvent(self, event):
+        # Remove reference from the main window when closed.
+        if self.sensor_index in self.main_window.sensor_windows:
+            del self.main_window.sensor_windows[self.sensor_index]
+        event.accept()
+        
+        
+
+###### Main Sensor Interface ######
+
+#This controls GUI, data storage, recording, graphs and arduino input
+class SensorInterface(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Sensor Data Monitor")
+        self.resize(1000, 800)
+        self.current_file = None
+        self.setupMenu()
+        
+        self.csv_file_path = r"C:\Users\anche\Documents\Uni\Year 3\Group Project\sensor_data.csv"
+
+    # Create CSV file and write header if it doesn't exist
+        with open(self.csv_file_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+            "Timestamp",
+            "MCP9808 Temperature",
+            "SHT45 Temperature",
+            "SHT45 Humidity",
+            "SCD4X CO2",
+            "SCD4X Temperature",
+            "SCD4X Humidity"
+            ])
+
+
+
+        # Define sensors
+
+        self.sensor_names = ["SHT45 Temperature","SHT45 Humidity","MCP9808 Temperature","SCD4X CO2","SCD4X Temperature","SCD4X Humidity"]
+
+        self.sensor_types = ["temperature", "humidity", "temperature", "co2","temperature","humidity"]
+
+        # Data record: mapping sensor name to list of [timestamp, reading] pairs.
+        self.data_record = {name: [] for name in self.sensor_names}
+        # Initially, disable recording for all sensors.
+        self.recording_state = {name: False for name in self.sensor_names}
+        self.all_recording = False
+
+        # Dictionary to hold open sensor plot windows
+        self.sensor_windows = {}
+
+        # Main layout
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        self.main_layout = QVBoxLayout(central)
+        self.main_layout.setContentsMargins(10, 10, 10, 10)
+        self.main_layout.setSpacing(5)
+
+        #Global Start/Stop All Recordings Button
+        self.all_recordings_button = QPushButton("Start All Recordings")
+        self.all_recordings_button.clicked.connect(self.toggleAllRecordings)
+        self.main_layout.addWidget(self.all_recordings_button)
+
+        #Sensor display area: grid layout for sensor labels, current reading, controls, display checkbox, flag, and recording count.
+        sensor_area = QWidget()
+        grid_layout = QtWidgets.QGridLayout(sensor_area)
+        grid_layout.setSpacing(5)
+        
+        # Lists to hold widgets for each sensor.
+        self.sensor_value_buttons = []
+        self.start_buttons = []
+        self.stop_buttons = []
+        self.display_checkboxes = []
+        self.flag_labels = []
+        self.recording_count_labels = []
+        
+        
+        #Define header labels
+        #Each row contains sensor name, current value, start button, stop button , display checkbox, status light, count of readings
+        headers = ["Sensor Name", "Current Value", "Start", "Stop", "Display", "Status", "Count"]
+       
+        for col, header in enumerate(headers):
+            header_lbl = QLabel(f"<b>{header}</b>")
+            grid_layout.addWidget(header_lbl, 0, col)
+        
+        # Create rows for each sensor
+        for i, name in enumerate(self.sensor_names):
+            row = i + 1  # offset by 1 for header
+            # Sensor name label.
+            lbl = QLabel(name)
+            grid_layout.addWidget(lbl, row, 0)
+            
+            # Current value button (clickable to open live plot)
+            val_btn = QPushButton("--")
+            val_btn.setFlat(True)
+            val_btn.clicked.connect(lambda checked, idx=i: self.openSensorPlot(idx))
+            grid_layout.addWidget(val_btn, row, 1)
+            self.sensor_value_buttons.append(val_btn)
+            
+            # Start button
+            start_btn = QPushButton("Start")
+            start_btn.clicked.connect(lambda checked, idx=i: self.startRecording(idx))
+            start_btn.setEnabled(True)  # since recording is off initially
+            grid_layout.addWidget(start_btn, row, 2)
+            self.start_buttons.append(start_btn)
+            
+            # Stop button
+            stop_btn = QPushButton("Stop")
+            stop_btn.clicked.connect(lambda checked, idx=i: self.stopRecording(idx))
+            stop_btn.setEnabled(False)
+            grid_layout.addWidget(stop_btn, row, 3)
+            self.stop_buttons.append(stop_btn)
+            
+            # Display checkbox
+            chk = QtWidgets.QCheckBox()
+            chk.setChecked(True)
+            grid_layout.addWidget(chk, row, 4)
+            self.display_checkboxes.append(chk)
+           
+            # Flag indicator label (red = no recent data, green = data received)
+            flag_lbl = QLabel("o")
+            flag_lbl.setStyleSheet("color: red; font-size: 16px;")
+            grid_layout.addWidget(flag_lbl, row, 5)
+            self.flag_labels.append(flag_lbl)
+            
+            # Recording count label.
+            count_lbl = QLabel("0")
+            font = count_lbl.font()
+            font.setPointSize(14)
+            count_lbl.setFont(font)
+            grid_layout.addWidget(count_lbl, row, 6)
+            self.recording_count_labels.append(count_lbl)
+            self.main_layout.addWidget(sensor_area)
+            
+            #Sensor loop ends here
+            
+     
+      
+        ######Plot Creation and Layout #####
+        #After intitial testing, the number of graphs meant that tabs appeared neater
+  
+        # Temperature plot
+        # Temperature ouputs are from SHT45 , MCP9808 and SCD4X which represent 0,2,4 in the line output
+        self.temp_fig = Figure(figsize=(5, 3))
+        self.temp_canvas = FigureCanvas(self.temp_fig)
+        self.ax_temp = self.temp_fig.add_subplot(111)
+        self.ax_temp.set_xlabel("Time")
+        self.ax_temp.set_ylabel("Temperature (C)")
+        self.temp_lines = {}
+        for i in [0, 2, 4]:
+            line, = self.ax_temp.plot([], [], '-', label=self.sensor_names[i])
+            self.temp_lines[self.sensor_names[i]] = line
+            self.ax_temp.legend()
+
+        # Humidity plot
+        self.hum_fig = Figure(figsize=(5, 3))
+        self.hum_canvas = FigureCanvas(self.hum_fig)
+        self.ax_hum = self.hum_fig.add_subplot(111)
+        self.ax_hum.set_xlabel("Time")
+        self.ax_hum.set_ylabel("Humidity (%)")
+        self.hum_lines = {}
+        for i in [1, 5]:
+            line, = self.ax_hum.plot([], [], '-', label=self.sensor_names[i])
+            self.hum_lines[self.sensor_names[i]] = line
+            self.ax_hum.legend()
+
+       # CO2 plot
+        self.co2_fig = Figure(figsize=(5, 3))
+        self.co2_canvas = FigureCanvas(self.co2_fig)
+        self.ax_co2 = self.co2_fig.add_subplot(111)
+        self.ax_co2.set_xlabel("Time")
+        self.ax_co2.set_ylabel("CO2 (ppm)")
+        self.co2_lines = {}
+        line, = self.ax_co2.plot([], [], '-', label="SCD4X CO2")
+        self.co2_lines["SCD4X CO2"] = line
+        self.ax_co2.legend()
+
+
+        self.tab_widget = QtWidgets.QTabWidget()
+  
+        #Temperature tab
+        temp_tab = QWidget()
+        temp_layout = QVBoxLayout(temp_tab)
+        temp_layout.addWidget(self.temp_canvas)
+        self.tab_widget.addTab(temp_tab, "Temperature")
+  
+        # Humidity tab
+        hum_tab = QWidget()
+        hum_layout = QVBoxLayout(hum_tab)
+        hum_layout.addWidget(self.hum_canvas)
+        self.tab_widget.addTab(hum_tab, "Humidity")
+  
+        # CO2 tab
+        co2_tab = QWidget()
+        co2_layout = QVBoxLayout(co2_tab)
+        co2_layout.addWidget(self.co2_canvas)
+        self.tab_widget.addTab(co2_tab, "CO2")
+  
+        # Add tab widget to main layout
+        self.main_layout.addWidget(self.tab_widget)
+
+        # Set stretch factors (adjust these as needed)
+        self.main_layout.setStretch(0, 0)  # global button
+        self.main_layout.setStretch(1, 1)  # sensor grid
+        self.main_layout.setStretch(2, 4)  # tab widget
+
+        # Timer to update the GUI plots, sensor displays, and status every second.
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self.updateData)
+        self.timer.start()
+
+        #Starting serial monitor
+        self.serial_thread = QtCore.QThread()
+        
+        #Adjusting Port
+        self.serial_worker = SerialReaderWorker(port='COM6', baudrate=115200)
+        self.serial_worker.moveToThread(self.serial_thread)
+        self.serial_thread.started.connect(self.serial_worker.run)
+        self.serial_worker.data_received.connect(self.onSerialData)
+        self.serial_thread.start()
+
+    def setupMenu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        open_action = QAction("Open", self)
+        open_action.triggered.connect(self.openFile)
+        file_menu.addAction(open_action)
+        save_action = QAction("Save", self)
+        save_action.triggered.connect(self.saveFile)
+        file_menu.addAction(save_action)
+        save_as_action = QAction("Save As", self)
+        save_as_action.triggered.connect(self.saveFileAs)
+        file_menu.addAction(save_as_action)
+        file_menu.addSeparator()
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        edit_menu = menubar.addMenu("Edit")
+        reset_action = QAction("Reset Data", self)
+        reset_action.triggered.connect(self.resetData)
+        edit_menu.addAction(reset_action)
+        
+        save_graphs_action = QAction("Export Graphs", self)
+        save_graphs_action.triggered.connect(self.saveGraphs)
+        file_menu.addAction(save_graphs_action) 
+
+    def toggleAllRecordings(self):
+        self.all_recording = not self.all_recording
+        for i, name in enumerate(self.sensor_names):
+            self.recording_state[name] = self.all_recording
+            if self.all_recording:
+                self.start_buttons[i].setEnabled(False)
+                self.stop_buttons[i].setEnabled(True)
+            else:
+                self.start_buttons[i].setEnabled(True)
+                self.stop_buttons[i].setEnabled(False)
+        if self.all_recording:
+            self.all_recordings_button.setText("Stop All Recordings")
+        else:
+            self.all_recordings_button.setText("Start All Recordings")
+
+    def resetData(self):
+        """Reset recorded data and clear plots."""
+        self.data_record = {name: [] for name in self.sensor_names}
+        for name, line in self.temp_lines.items():
+            line.set_data([], [])
+        for name, line in self.hum_lines.items():
+            line.set_data([], [])
+        self.temp_canvas.draw()
+        self.hum_canvas.draw()
+
+    def startRecording(self, idx):
+        sensor_name = self.sensor_names[idx]
+        self.recording_state[sensor_name] = True
+        self.start_buttons[idx].setEnabled(False)
+        self.stop_buttons[idx].setEnabled(True)
+
+    def stopRecording(self, idx):
+        sensor_name = self.sensor_names[idx]
+        self.recording_state[sensor_name] = False
+        self.start_buttons[idx].setEnabled(True)
+        self.stop_buttons[idx].setEnabled(False)
+
+    def updateData(self):
+        """Update sensor displays, flags, counts, and plots using the latest recorded data."""
+        # Update sensor displays and extra info.
+        for i, name in enumerate(self.sensor_names):
+            if self.data_record[name]:
+                latest_value = self.data_record[name][-1][1]
+                if self.sensor_types[i] == "temperature":
+                    self.sensor_value_buttons[i].setText(f"{latest_value:.1f} C")
+                elif self.sensor_types[i] == "humidity":
+                    self.sensor_value_buttons[i].setText(f"{latest_value:.1f} %")
+                elif self.sensor_types[i] == "co2":
+                    self.sensor_value_buttons[i].setText(f"{latest_value:.0f} ppm")
+                                                         
+                
+                
+            # Update recording count label.
+            self.recording_count_labels[i].setText(str(len(self.data_record[name])))
+            
+            # Update flag indicator: green if data received within last 10 se
+            if self.data_record[name]:
+                last_time = datetime.fromisoformat(self.data_record[name][-1][0])
+                if (datetime.now() - last_time).total_seconds() < 10:
+                    self.flag_labels[i].setStyleSheet("color: green; font-size: 16px;")
+                else:
+                    self.flag_labels[i].setStyleSheet("color: red; font-size: 16px;")
+            else:
+                self.flag_labels[i].setStyleSheet("color: red; font-size: 16px;")
+
+        # Update temperature plot (for indices 0,1,2,3,4,6)
+        temp_times_all = []
+        for i in [0, 2, 4]:
+            name = self.sensor_names[i]
+            data = self.data_record[name]
+            if self.display_checkboxes[i].isChecked() and data:
+                times = [datetime.fromisoformat(entry[0]) for entry in data]
+                values = [entry[1] for entry in data]
+                self.temp_lines[name].set_data(times, values)
+                temp_times_all.extend(times)
+            else:
+                self.temp_lines[name].set_data([], [])
+        if temp_times_all:
+            self.ax_temp.set_xlim(min(temp_times_all), max(temp_times_all))
+        self.ax_temp.relim()
+        self.ax_temp.autoscale_view(scalex=False, scaley=True)
+        self.temp_canvas.draw()
+
+        # Update humidity plot (for indices 5,7)
+        hum_times_all = []
+        for i in [1, 5]:
+            name = self.sensor_names[i]
+            data = self.data_record[name]
+            if self.display_checkboxes[i].isChecked() and data:
+                times = [datetime.fromisoformat(entry[0]) for entry in data]
+                values = [entry[1] for entry in data]
+                self.hum_lines[name].set_data(times, values)
+                hum_times_all.extend(times)
+            else:
+                self.hum_lines[name].set_data([], [])
+        if hum_times_all:
+            self.ax_hum.set_xlim(min(hum_times_all), max(hum_times_all))
+        self.ax_hum.relim()
+        self.ax_hum.autoscale_view(scalex=False, scaley=True)
+        self.hum_canvas.draw()
+
+        # Update any open sensor-specific plot windows.
+        for window in self.sensor_windows.values():
+            window.updatePlot()
+            
+        # Update CO2 plot
+        co2_times_all = []
+        name = "SCD4X CO2"
+        data = self.data_record[name]   
+
+        if data:
+            times = [datetime.fromisoformat(entry[0]) for entry in data]
+            values = [entry[1] for entry in data]
+            self.co2_lines[name].set_data(times, values)
+            co2_times_all.extend(times)
+        else:
+            self.co2_lines[name].set_data([], [])
+
+        if co2_times_all:
+            self.ax_co2.set_xlim(min(co2_times_all), max(co2_times_all))
+
+        self.ax_co2.relim()
+        self.ax_co2.autoscale_view(scalex=False, scaley=True)
+        self.co2_canvas.draw()
+
+
+
+    def onSerialData(self, sensor_data):
+          # Arduino actual format: [MCP9808_TEMP, SHT45_TEMP, SHT45_HUMIDITY, SCD4X_CO2, SCD4X_TEMP, SCD4X_HUMIDITY]
+          print(f"Raw data received: {sensor_data}")  # Debug line
+          now = datetime.now().isoformat()
+          
+          #Saves raw sensor data row to CSV file
+          with open(self.csv_file_path, 'a', newline='') as f:
+              writer = csv.writer(f)
+              writer.writerow([
+                  now,
+                  sensor_data[0],
+                  sensor_data[1],
+                  sensor_data[2],
+                  sensor_data[3],
+                  sensor_data[4],
+                  sensor_data[5]
+                  ])
+          try:
+            # Index 0: MCP9808 Temperature
+            if self.recording_state["MCP9808 Temperature"]and sensor_data[0] != 0:
+                self.data_record["MCP9808 Temperature"].append([now, sensor_data[0]])
+
+            # Index 1: SHT45 Temperature
+            if self.recording_state["SHT45 Temperature"] and sensor_data[1] != 0:
+                self.data_record["SHT45 Temperature"].append([now, sensor_data[1]])
+
+            # Index 2: SHT45 Humidity
+            if self.recording_state["SHT45 Humidity"] and sensor_data[2] != 0:
+                self.data_record["SHT45 Humidity"].append([now, sensor_data[2]])
+
+            # Index 3: SCD4X CO2
+            if self.recording_state["SCD4X CO2"] and sensor_data[3] != 0:
+                self.data_record["SCD4X CO2"].append([now, sensor_data[3]])
+
+            # Index 4: SCD4X Temperature
+            if self.recording_state["SCD4X Temperature"] and sensor_data[4] != 0:
+                self.data_record["SCD4X Temperature"].append([now, sensor_data[4]])
+
+            # Index 5: SCD4X Humidity
+            if self.recording_state["SCD4X Humidity"] and sensor_data[5] != 0:
+                self.data_record["SCD4X Humidity"].append([now, sensor_data[5]])
+
+          except Exception as e:
+            print("Error processing serial data:", e)
+
+    def openSensorPlot(self, idx):
+        """Open (or focus) a live plot window for the specified sensor."""
+        if idx in self.sensor_windows:
+            self.sensor_windows[idx].raise_()
+            self.sensor_windows[idx].activateWindow()
+        else:
+            window = SensorPlotWindow(idx, self)
+            self.sensor_windows[idx] = window
+            window.show()
+
+    def openFile(self):
+        """Open a JSON file containing sensor data."""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Open Data File", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if file_name:
+            try:
+                with open(file_name, 'r', encoding='utf-8') as file:
+                    data = json.load(file)
+                self.data_record = data
+                self.current_file = file_name
+                self.updateData()
+            except Exception as e:
+                QMessageBox.warning(self, "Open File", f"Could not open file: {e}")
+
+
+    #Function below saves sensor data to a current file or prompts user is file doesnt exist
+    def saveFile(self):
+        if self.current_file:
+            try:
+                with open(self.current_file, 'w', encoding='utf-8') as file:
+                    json.dump(self.data_record, file, indent=4)
+            except Exception as e:
+                QMessageBox.warning(self, "Save File", f"Could not save file: {e}")
+        else:
+            self.saveFileAs()
+
+    #Function below is about saving the sensor data to a named file
+    def saveFileAs(self):
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, "Save Data File", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if file_name:
+            self.current_file = file_name
+            self.saveFile()
+            
+    #Function below saves the data as a CSV file with all the timestamps as a JSON file      
+    def saveCSV(self):
+        """Save sensor data to a CSV file."""
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, "Save CSV File", "", "CSV Files (*.csv)"
+    )
+
+        if not file_name:
+            return
+
+        try:
+            # Collect all timestamps
+            timestamps = set()
+            for sensor in self.sensor_names:
+                for entry in self.data_record[sensor]:
+                    timestamps.add(entry[0])
+
+            timestamps = sorted(timestamps)
+
+        # Create lookup dictionaries for each sensor
+            sensor_lookup = {}
+            for sensor in self.sensor_names:
+                sensor_lookup[sensor] = {t: v for t, v in self.data_record[sensor]}
+
+            with open(file_name, 'w', newline='') as f:
+                writer = csv.writer(f)
+
+            # Write header
+            header = ["Timestamp"] + self.sensor_names
+            writer.writerow(header)
+
+            # Write rows
+            for t in timestamps:
+                row = [t]
+                for sensor in self.sensor_names:
+                    value = sensor_lookup[sensor].get(t, "")
+                    row.append(value)
+                writer.writerow(row)
+
+            QMessageBox.information(self, "CSV Save", "Data successfully saved.")
+
+        except Exception as e:
+            QMessageBox.warning(self, "CSV Save Error", str(e))
+
+    #Function below stops the serial worker and thread when GUI is closed
+    def closeEvent(self, event):
+        self.serial_worker.stop()
+        self.serial_thread.quit()
+        self.serial_thread.wait()
+        event.accept()
+        
+    #Function below saves graphs
+    def saveGraphs(self):
+        """Save all plots as image files."""
+    
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Save Graphs")
+
+        if not folder:
+            return
+
+        try:
+            # Save temperature graph to specified location 
+            temp_path = r"C:\Users\anche\Documents\Uni\Year 3\Group Project\temperature_plot.png"
+            self.temp_fig.savefig(temp_path)
+
+            # Save humidity graph to specified location
+            hum_path = r"C:\Users\anche\Documents\Uni\Year 3\Group Project\humidity_plot.png"
+            self.hum_fig.savefig(hum_path)
+
+            # Save CO2 graph to specified location
+            co2_path = r"C:\Users\anche\Documents\Uni\Year 3\Group Project\co2_plot.png"
+            self.co2_fig.savefig(co2_path)
+
+            QMessageBox.information(self, "Graphs Saved", "Graphs saved successfully!")
+
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", str(e))
+
+
+##### Main entry point that starts program #####
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = SensorInterface()
+    window.show()
+    sys.exit(app.exec_())
