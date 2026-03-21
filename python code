@@ -127,7 +127,8 @@ class SensorInterface(QMainWindow):
         self.resize(1000, 800)
         self.current_file = None
         self.setupMenu()
-        
+
+        ######### PUT FILE LOCATION HERE ######
         self.csv_file_path = r"C:\Users\anche\Documents\Uni\Year 3\Group Project\sensor_data.csv"
 
     # Create CSV file and write header if it doesn't exist
