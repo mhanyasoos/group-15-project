@@ -25,7 +25,7 @@ The project utilizes a dual-system approach to monitor variables affecting the P
 * /data: Experimental datasets from UCL Student Centre and Biomedical Engineering labs.
 
 ## Methodology and Validation
-The system was validated through fixed-location trials and vertical profiling within university environments. Data collection standardized 9:00 AM – 12:00 PM recording windows. Subjective feedback was gathered via digital surveys aligned with the PMV model.
+The system was validated through fixed-location trials and vertical profiling within university environments. Data collection standardised 9:00 AM – 12:00 PM recording windows. Subjective feedback was gathered via digital surveys aligned with the PMV model.
 
 ## Safety and Compliance
 Development followed departmental risk assessment protocols[cite: 3]:
