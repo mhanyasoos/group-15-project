@@ -1,7 +1,7 @@
 # Wireless Thermal Comfort Sensing System
 
 ## Project Overview
-This repository contains source code, hardware configurations, and experimental data for a wireless wearable thermal comfort sensing system. Developed for a BSc Group Project at the UCL Department of Physics and Astronomy, the system synchronizes environmental and physiological data to assess individual thermal sensation in real time.
+This repository contains source code, hardware configurations, and experimental data for a wireless wearable thermal comfort sensing system. Developed for a BSc Group Project at the UCL Department of Physics and Astronomy, the system synchronises environmental and physiological data to assess individual thermal sensation in real time.
 
 ## System Architecture
 The project utilizes a dual-system approach to monitor variables affecting the Predicted Mean Vote (PMV) model:
